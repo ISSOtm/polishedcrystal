@@ -346,7 +346,7 @@ ENDM
 	ld a, [de]
 	ld [hli], a
 	inc de
-	jr .fill
+	db $FE ; cp <imm8>, gobbling next byte.
 
 ;; LZ_ZERO: set N of the output bytes to zeros.
 .lz_zero
