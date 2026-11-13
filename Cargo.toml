@@ -1,0 +1,15 @@
+[package]
+name = "polishedcrystal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# This page left intentionally blank.
+
+[[bin]]
+name = "lzpcompress"
+path = "tools/lzpcompress.rs"
+
+[lints.rust]
+# This `cfg` is used to print computed command costs in `describe()`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(describe_costs)'] }

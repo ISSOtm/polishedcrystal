@@ -67,3 +67,8 @@ bank_ends.txt
 # local tools
 rgbds/
 deploy.sh
+
+
+# Added by cargo
+
+/target

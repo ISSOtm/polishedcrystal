@@ -1152,12 +1152,14 @@ static void serialize(
     char const *filename
 ) {
 	size_t byte_idx = 0;
+	size_t sum = 0;
 	for (Command const &cmd : cmds) {
 		LzCmd const &inner_base = lz_cmd(cmd);
 		assert(inner_base.len >= inner_base.min_length());
 		assert(inner_base.len <= inner_base.max_length());
 		if (print_costs) {
-			fprintf(output, "/* %2zu */", inner_base.num_encoded_bytes());
+			sum += inner_base.num_encoded_bytes();
+			fprintf(output, "/* %2zu sum %3zu */", inner_base.num_encoded_bytes(), sum);
 		}
 		inner_base.serialize(
 		    ByteSpan{uncompressed}.subspan(byte_idx, inner_base.len),
@@ -1185,12 +1187,14 @@ static void serialize(
     char const *filename
 ) {
 	size_t byte_idx = 0;
+	size_t sum = 0;
 	for (auto const &[cmd, payload] : cmds) {
 		LzCmd const &inner_base = lz_cmd(cmd);
 		assert(inner_base.len >= inner_base.min_length());
 		assert(inner_base.len <= inner_base.max_length());
 		if (print_costs) {
-			fprintf(output, "/* %2zu */", inner_base.num_encoded_bytes());
+			sum += inner_base.num_encoded_bytes();
+			fprintf(output, "/* %2zu sum %3zu */", inner_base.num_encoded_bytes(), sum);
 		}
 		inner_base.serialize(
 		    ByteSpan{uncompressed}.subspan(byte_idx, inner_base.len),
