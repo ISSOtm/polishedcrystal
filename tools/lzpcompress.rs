@@ -1247,8 +1247,13 @@ impl LzCmd for LzCopyNormal {
 }
 impl LzCopyCmd for LzCopyNormal {
     fn decompress(&self, dest: &mut Vec<u8>) {
+        dest.reserve(self.len.get().into());
+
+        // Do not use `extend_from_within`, since the copy can run off the end of the pre-start vector!
         let start_idx = self.start_ofs.idx_within(dest).unwrap();
-        dest.extend_from_within(start_idx..start_idx + usize::from(self.len.get()));
+        for idx in start_idx..start_idx + usize::from(self.len.get()) {
+            dest.push(dest[idx]);
+        }
     }
 
     const CMD_ID: LzCmdId = LzCmdId::CopyNormal;
