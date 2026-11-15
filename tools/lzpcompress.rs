@@ -122,6 +122,10 @@ fn main() {
     };
     let res = match options.mode {
         OperationMode::Compress(output_mode) => {
+            if try_gb_len(input_bytes.len()).is_none() {
+                eprintln!("error: input file is too large to be decompressed on the GB");
+                std::process::exit(EXIT_DATA_ERR);
+            }
             let commands = compress(&input_bytes);
 
             match output_mode {
@@ -416,7 +420,6 @@ fn deserialize<'data>(compressed: &'data [u8]) -> std::io::Result<Vec<Command<'d
     if compressed.is_empty() {
         return Err(eof_err("empty input"));
     }
-    try_gb_len(compressed.len()); // TODO
 
     let mut commands = Vec::new();
     let mut rest = compressed;
