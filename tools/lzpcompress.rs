@@ -1299,10 +1299,9 @@ impl LzCopyCmd for LzCopyFlipped {
     fn decompress(&self, dest: &mut Vec<u8>) {
         dest.reserve(self.len.get().into());
 
-        let mut start_idx = self.start_ofs.idx_within(dest).unwrap();
-        for _ in 0..self.len.get() {
-            dest.push(dest[start_idx].reverse_bits());
-            start_idx += 1;
+        let start_idx = self.start_ofs.idx_within(dest).unwrap();
+        for idx in start_idx..start_idx + usize::from(self.len.get()) {
+            dest.push(dest[idx].reverse_bits());
         }
     }
 
