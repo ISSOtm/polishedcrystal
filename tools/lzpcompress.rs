@@ -68,7 +68,7 @@ use std::{
     collections::VecDeque,
     fs::File,
     io::{Read, Write},
-    num::IntErrorKind,
+    num::{IntErrorKind, NonZeroU16},
     ops::RangeInclusive,
     path::{Path, PathBuf},
 };
@@ -238,25 +238,11 @@ macro_rules! forward {
 }
 impl Command<'_> {
     forward! { fn assert_length_valid(&self) }
-    forward! { fn decompressed_length(&self) -> u16 }
-    forward! { fn num_encoded_bytes(&self) -> u16 }
+    forward! { fn decompressed_length(&self) -> NonZeroU16 }
+    forward! { fn num_encoded_bytes(&self) -> NonZeroU16 }
     forward! { fn serialize(&self, output: impl Write) -> std::io::Result<()> }
     forward! { fn describe(&self, bytes: &[u8], output: impl Write) -> std::io::Result<()> }
     forward! { fn decompress(&self, dest: &mut Vec<u8>) }
-
-    fn dummy() -> Self {
-        Self::Data(LzData { bytes: &[] })
-    }
-
-    fn cost_of_chain(&self, prev_optimal_chains: &[(u16, Command<'_>)]) -> u16 {
-        let cost_of_this = self.num_encoded_bytes();
-        let len_decompressed_before =
-            prev_optimal_chains.len() - usize::from(self.decompressed_length() - 1);
-        let cost_of_chain_leading_to_this = len_decompressed_before
-            .checked_sub(1)
-            .map_or(0, |idx| prev_optimal_chains[idx].0);
-        cost_of_this + cost_of_chain_leading_to_this
-    }
 }
 
 fn compress<'data>(uncompressed: &'data [u8]) -> VecDeque<Command<'data>> {
@@ -288,70 +274,91 @@ fn compress<'data>(uncompressed: &'data [u8]) -> VecDeque<Command<'data>> {
     let mut best_cmds = Vec::with_capacity(uncompressed.len()); // Can't use `.collect()` because each iteration depends on the previous.
 
     while best_cmds.len() != uncompressed.len() {
-        // Place a dummy command that we know will be overwritten.
-        const DUMMY_COST: u16 = u16::MAX;
-        best_cmds.push((DUMMY_COST, Command::dummy()));
-        let num_bytes_emitted = best_cmds.len();
-
         // Bytes that will have been emitted when the sought command is finished.
-        let decompressed_thus_far = &uncompressed[..num_bytes_emitted];
-
-        let ((lowest_cost, best_cmd), prev_optimal_chains) = best_cmds.split_last_mut().unwrap();
-        // TODO: this short-circuiting is only performed *after* a valid command has been found...
-        //       but constant-cost commands may be (expensively) attempted and discarded without reaching this!
-        let mut consider = |candidate: Command<'data>| {
-            // TODO: use this insteqd
-            // let total_cost = candidate.cost_of_chain(prev_optimal_chains);
-            let this_cost = candidate.num_encoded_bytes();
-            let start_ofs = num_bytes_emitted - usize::from(candidate.decompressed_length());
-            // Cost of this command, plus cost of the optimal command chain that ends where this one begins.
-            let total_cost = this_cost
-                + start_ofs
-                    .checked_sub(1)
-                    .map_or(0, |idx| prev_optimal_chains[idx].0);
-            assert_matches!(total_cost, ..DUMMY_COST); // Ensures that the first considered command overwrites the dummy.
-
-            // If this candidate would be a strict improvement, retain it.
-            if total_cost < *lowest_cost {
-                *lowest_cost = total_cost;
-                *best_cmd = candidate;
-                true
-            } else {
-                this_cost < *lowest_cost
-            }
-        };
+        let decompressed_thus_far = &uncompressed[..=best_cmds.len()];
+        let mut best_chain = None;
 
         if decompressed_thus_far[decompressed_thus_far.len() - 1] == 0 {
-            LzZero::for_each_possible_cmd(&mut consider, decompressed_thus_far);
+            LzZero::for_each_possible_cmd(&mut best_chain, decompressed_thus_far, &best_cmds);
         } else {
-            LzRepeat::for_each_possible_cmd(&mut consider, decompressed_thus_far);
+            LzRepeat::for_each_possible_cmd(&mut best_chain, decompressed_thus_far, &best_cmds);
         }
 
-        LzAlternate::for_each_possible_cmd(&mut consider, decompressed_thus_far);
+        LzAlternate::for_each_possible_cmd(&mut best_chain, decompressed_thus_far, &best_cmds);
 
-        LzSpecialPackhi0::for_each_possible_cmd(&mut consider, decompressed_thus_far);
-        LzSpecialPack16Short::for_each_possible_cmd(&mut consider, decompressed_thus_far);
-        LzSpecialPacklo0::for_each_possible_cmd(&mut consider, decompressed_thus_far);
+        LzSpecialPackhi0::for_each_possible_cmd(&mut best_chain, decompressed_thus_far, &best_cmds);
+        LzSpecialPack16Short::for_each_possible_cmd(
+            &mut best_chain,
+            decompressed_thus_far,
+            &best_cmds,
+        );
+        LzSpecialPacklo0::for_each_possible_cmd(&mut best_chain, decompressed_thus_far, &best_cmds);
 
-        for_each_possible_copy_cmd(&mut consider, decompressed_thus_far);
+        for_each_possible_copy_cmd(&mut best_chain, decompressed_thus_far, &best_cmds);
 
-        // Consider `LzData` last, since its cost increases quickly, and thus the iteration may be
-        // stopped very early if any of the previous commands succeeded at finding a more optimal
-        // solution (and faster, too).
-        LzData::for_each_possible_cmd(&mut consider, decompressed_thus_far);
+        // `LzData` is a command that never fails to match, thus, on its own,
+        // it would iterate over the entire `decompressed_thus_far`, which is slow.
+        // However, having considered other commands will allow terminating that search early,
+        // thanks to the “short-circuit indicator” returned by `CommandChain::consider`.
+        LzData::for_each_possible_cmd(&mut best_chain, decompressed_thus_far, &best_cmds);
 
-        assert_ne!(*lowest_cost, DUMMY_COST); // The dummy command should at *least* have been overwritten by a `LzData`.
+        best_cmds.push(best_chain.unwrap());
     }
 
     // Done! Now, we walk the list of commands (backwards).
     let mut best_path = VecDeque::new();
     let mut end_ofs = uncompressed.len();
     while end_ofs != 0 {
-        let cmd = best_cmds[end_ofs - 1].1.clone();
-        end_ofs -= usize::from(cmd.decompressed_length());
+        let cmd = best_cmds.drain(end_ofs - 1..).next().unwrap().last_cmd;
+        end_ofs -= usize::from(cmd.decompressed_length().get());
         best_path.push_front(cmd);
     }
     best_path
+}
+struct CommandChain<'data> {
+    last_cmd: Command<'data>,
+    total_cost: NonZeroU16,
+}
+impl<'data> CommandChain<'data> {
+    fn consider(
+        cur: &mut Option<Self>,
+        candidate_last_cmd: Command<'data>,
+        prev_optimal_chains: &[Self],
+    ) -> bool {
+        // Only retain *strict* cost improvements.
+        let improves_over_cur_best =
+            |cost| !cur.as_ref().is_some_and(|chain| chain.total_cost <= cost);
+
+        let cost_of_candidate = candidate_last_cmd.num_encoded_bytes();
+        // Since a positive integer is always added to a candidate's cost
+        // (zero iff this candidate would be the first), and we reject ties,
+        // a command only has a chance to be picked if it's *strictly* smaller than the current total cost.
+        // This is especially important for stopping `LzData` considerations early.
+        if !improves_over_cur_best(cost_of_candidate) {
+            return false;
+        }
+
+        let len_decompressed_before = gb_len(prev_optimal_chains.len())
+            - (candidate_last_cmd.decompressed_length().get() - 1);
+        let cost_of_chain_leading_to_candidate =
+            len_decompressed_before.checked_sub(1).map_or(0, |idx| {
+                prev_optimal_chains[usize::from(idx)].total_cost.get()
+            });
+
+        let Some(total_cost) = cost_of_candidate
+            .checked_add(cost_of_chain_leading_to_candidate)
+            .filter(|cost| cost.get() <= MAX_GB_LEN)
+        else {
+            return true; // Reject chains that would take more than the maximum permissible length.
+        };
+        if improves_over_cur_best(total_cost) {
+            *cur = Some(Self {
+                last_cmd: candidate_last_cmd,
+                total_cost,
+            });
+        }
+        true
+    }
 }
 
 // Must decompress to a buffer, so that back-refs (`LzCopy`-derived commands) can access previous output.
@@ -382,9 +389,9 @@ fn describe(
     let mut sum = 0;
     for command in commands {
         command.assert_length_valid();
-        let (cmd_output, rest) = decompressed.split_at(command.decompressed_length().into());
+        let (cmd_output, rest) = decompressed.split_at(command.decompressed_length().get().into());
         if cfg!(describe_costs) {
-            sum += command.num_encoded_bytes();
+            sum += command.num_encoded_bytes().get();
             write!(
                 output,
                 "/* {:2} sum {sum:3} */",
@@ -470,7 +477,10 @@ fn deserialize<'data>(compressed: &'data [u8]) -> std::io::Result<Vec<Command<'d
             Err(LzSpecialCmdId::End) => break,
         };
 
-        assert_eq!(gb_len(len_before_cmd - rest.len()), cmd.num_encoded_bytes());
+        assert_eq!(
+            gb_len(len_before_cmd - rest.len()),
+            cmd.num_encoded_bytes().get(),
+        );
         commands.push(cmd);
     }
 
@@ -489,31 +499,36 @@ fn deserialize<'data>(compressed: &'data [u8]) -> std::io::Result<Vec<Command<'d
 
 trait LzCmd {
     /// Number of bytes that this command decompresses to.
-    fn decompressed_length(&self) -> u16;
+    fn decompressed_length(&self) -> NonZeroU16;
     /// This command refuses to encode fewer bytes than this.
     // Most commands are fine with encoding a single byte, but several have had their implementation
     // tweaked to unconditionally write more bytes than the length field encodes, because they would
     // otherwise be redundant with another command (e.g. `lzdata <byte>` is encoded using as many
     // bytes as `lzrepeat 1, <byte>` while emitting the same byte), and increasing the maximum
     // representable length allows a command to be more efficient at compressing data.
-    const MIN_DECOMPRESSED_LENGTH: u16;
+    const MIN_DECOMPRESSED_LENGTH: NonZeroU16;
     /// This command cannot encode more bytes than this. (Inclusive.)
-    const MAX_DECOMPRESSED_LENGTH: u16 =
-        Self::MIN_DECOMPRESSED_LENGTH + LzCmdHeader::MAX_LONG_LENGTH - 1;
+    const MAX_DECOMPRESSED_LENGTH: NonZeroU16 = Self::MIN_DECOMPRESSED_LENGTH
+        .checked_add(LzCmdHeader::MAX_LONG_LENGTH - 1)
+        .unwrap();
 
     /// How many bytes in the compressed output would this command take?
-    fn num_encoded_bytes(&self) -> u16;
+    fn num_encoded_bytes(&self) -> NonZeroU16;
     fn describe(&self, bytes: &[u8], output: impl Write) -> std::io::Result<()>;
 
     // Helpers.
 
-    fn decode_length(encoded_len: u16) -> u16 {
-        assert!(encoded_len >= Self::MIN_DECOMPRESSED_LENGTH);
-        assert!(encoded_len <= Self::MAX_DECOMPRESSED_LENGTH);
-        encoded_len + Self::MIN_DECOMPRESSED_LENGTH
+    fn decode_length(encoded_len: u16) -> NonZeroU16 {
+        Self::MIN_DECOMPRESSED_LENGTH
+            .checked_add(encoded_len)
+            .filter(|len| *len <= Self::MAX_DECOMPRESSED_LENGTH)
+            .expect(
+                "MAX_DECOMPRESSED_LENGTH should reflect the maximum length that encoding permits",
+            )
     }
     fn encoded_length(&self) -> u16 {
-        self.decompressed_length() - Self::MIN_DECOMPRESSED_LENGTH
+        self.assert_length_valid();
+        self.decompressed_length().get() - Self::MIN_DECOMPRESSED_LENGTH.get()
     }
     fn assert_length_valid(&self) {
         assert!(
@@ -532,13 +547,11 @@ trait LzCmd {
         }
     }
 
-    fn possible_data_lengths(decompressed_thus_far: &[u8]) -> RangeInclusive<u16> {
+    fn possible_data_lengths(source_range: &[u8]) -> RangeInclusive<NonZeroU16> {
         Self::MIN_DECOMPRESSED_LENGTH
-            ..=decompressed_thus_far
-                .len()
-                .min(Self::MAX_DECOMPRESSED_LENGTH.into()) // This *is* in u16 range...
-                .try_into()
-                .unwrap() // ...thus the smallest of the two *must* be in u16 range.
+            ..=NonZeroU16::new(gb_len(source_range.len()))
+                .unwrap()
+                .min(Self::MAX_DECOMPRESSED_LENGTH)
     }
 }
 
@@ -601,11 +614,11 @@ impl LzCmdHeader {
     /// Maximum length the “long” header format can encode. (Exclusive.)
     const MAX_LONG_LENGTH: u16 = 1 << 9;
 
-    fn num_encoded_bytes(&self) -> u16 {
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
         if self.encoded_len < Self::MAX_SHORT_LENGTH {
-            1
+            NonZeroU16::new(1).unwrap()
         } else {
-            2
+            NonZeroU16::new(2).unwrap()
         }
     }
     fn serialize(&self, mut output: impl Write) -> std::io::Result<()> {
@@ -643,15 +656,24 @@ struct LzData<'decompressed> {
 }
 impl<'decomp> LzData<'decomp> {
     fn for_each_possible_cmd(
-        mut consider: impl FnMut(Command<'decomp>) -> bool,
+        cur_chain: &mut Option<CommandChain<'decomp>>,
         decompressed_thus_far: &'decomp [u8],
+        prev_optimal_chains: &[CommandChain<'decomp>],
     ) {
+        // If there aren't enough bytes, don't even bother.
+        // (This helps commands with >1 minimum lengths, and doesn't hurt those with =1,
+        //  so it's kept for future-proofing.)
+        if gb_len(decompressed_thus_far.len()) < Self::MIN_DECOMPRESSED_LENGTH.get() {
+            return;
+        }
+
         for length in Self::possible_data_lengths(decompressed_thus_far) {
+            let command = Command::Data(Self {
+                bytes: last_n(decompressed_thus_far, length.get()),
+            });
             // Since this command's cost increases monotonically, if the cost becomes higher than the current best,
-            // any further attempts are guaranteed to fail.
-            if !consider(Command::Data(Self {
-                bytes: last_n(decompressed_thus_far, length),
-            })) {
+            // any further attempts are guaranteed to fail, and we can exit immediately.
+            if !CommandChain::consider(cur_chain, command, prev_optimal_chains) {
                 break;
             }
         }
@@ -665,7 +687,7 @@ impl<'decomp> LzData<'decomp> {
         output.write_all(self.bytes)
     }
     fn deserialize(encoded_len: u16, input: &mut &'decomp [u8]) -> std::io::Result<Self> {
-        match input.split_at_checked(Self::decode_length(encoded_len).into()) {
+        match input.split_at_checked(Self::decode_length(encoded_len).get().into()) {
             None => Err(eof_err("EOF while reading LzData bytes")),
             Some((bytes, rest)) => {
                 *input = rest;
@@ -679,15 +701,18 @@ impl<'decomp> LzData<'decomp> {
     }
 }
 impl LzCmd for LzData<'_> {
-    fn decompressed_length(&self) -> u16 {
-        self.bytes.len().try_into().unwrap()
+    fn decompressed_length(&self) -> NonZeroU16 {
+        NonZeroU16::new(gb_len(self.bytes.len())).unwrap()
     }
     // This is the “fallback” command, and thus it needs to be able to emit a single byte.
     // (See also the comment on `LzRepeat::MIN_DECOMPRESSED_LENGTH` for more details of this decision.)
-    const MIN_DECOMPRESSED_LENGTH: u16 = 1;
+    const MIN_DECOMPRESSED_LENGTH: NonZeroU16 = NonZeroU16::new(1).unwrap();
 
-    fn num_encoded_bytes(&self) -> u16 {
-        self.make_header(LzCmdId::Data).num_encoded_bytes() + gb_len(self.bytes.len())
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
+        self.make_header(LzCmdId::Data)
+            .num_encoded_bytes()
+            .checked_add(gb_len(self.bytes.len()))
+            .unwrap()
     }
     fn describe(&self, bytes: &[u8], mut output: impl Write) -> std::io::Result<()> {
         assert_eq!(self.bytes, bytes);
@@ -698,7 +723,7 @@ impl LzCmd for LzData<'_> {
 #[derive(Debug, Clone)]
 struct LzRepeat {
     byte: u8,
-    len: u16,
+    len: NonZeroU16,
 }
 impl LzRepeat {
     fn header(&self) -> LzCmdHeader {
@@ -706,28 +731,38 @@ impl LzRepeat {
     }
 
     fn for_each_possible_cmd<'data>(
-        mut consider: impl FnMut(Command<'data>) -> bool,
+        cur_chain: &mut Option<CommandChain<'data>>,
         decompressed_thus_far: &'data [u8],
+        prev_optimal_chains: &[CommandChain<'data>],
     ) {
+        // If there aren't enough bytes, don't even bother.
+        // (This helps commands with >1 minimum lengths, and doesn't hurt those with =1,
+        //  so it's kept for future-proofing.)
+        if gb_len(decompressed_thus_far.len()) < Self::MIN_DECOMPRESSED_LENGTH.get() {
+            return;
+        }
+
         let last_byte = *decompressed_thus_far.last().unwrap();
         // Any bytes between the start of `possible_data_lengths` and `last_byte` must also be repeats.
-        if gb_len(decompressed_thus_far.len()) < Self::MIN_DECOMPRESSED_LENGTH
-            || last_n(decompressed_thus_far, Self::MIN_DECOMPRESSED_LENGTH)
-                .iter()
-                .any(|&byte| byte != last_byte)
+        if last_n(decompressed_thus_far, Self::MIN_DECOMPRESSED_LENGTH.get())
+            .iter()
+            .any(|&byte| byte != last_byte)
         {
             return;
         }
         for length in Self::possible_data_lengths(decompressed_thus_far) {
-            // If the bytes are no longer repeating, stop.
-            if rev_idx(decompressed_thus_far, length) != last_byte {
-                break;
-            }
-            // TODO: this command's cost is actually constant.
-            if !consider(Command::Repeat(Self {
+            let command = Command::Repeat(Self {
                 byte: last_byte,
                 len: length,
-            })) {
+            });
+
+            // If the bytes are no longer repeating, stop.
+            if rev_idx(decompressed_thus_far, length.get()) != last_byte {
+                break;
+            }
+            // There's no point in considering commands that are too costly by themselves,
+            // and since command costs increase monotonically we can thus skip all ulterior iterations too.
+            if !CommandChain::consider(cur_chain, command, prev_optimal_chains) {
                 break;
             }
         }
@@ -754,21 +789,21 @@ impl LzRepeat {
     }
 
     fn decompress(&self, dest: &mut Vec<u8>) {
-        dest.extend(std::iter::repeat_n(self.byte, self.len.into()));
+        dest.extend(std::iter::repeat_n(self.byte, self.len.get().into()));
     }
 }
 impl LzCmd for LzRepeat {
-    fn decompressed_length(&self) -> u16 {
+    fn decompressed_length(&self) -> NonZeroU16 {
         self.len
     }
     // To avoid being equivalent to `LzData`.
     // Note that the minimum count of `LzData` could instead have been bumped to 2 instead, but
     // since that command performs no compression (it's pretty much a fall-back), we want to
     // generally avoid it, and thus it is not worth allowing it to be longer.
-    const MIN_DECOMPRESSED_LENGTH: u16 = 2;
+    const MIN_DECOMPRESSED_LENGTH: NonZeroU16 = NonZeroU16::new(2).unwrap();
 
-    fn num_encoded_bytes(&self) -> u16 {
-        self.header().num_encoded_bytes() + 1
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
+        self.header().num_encoded_bytes().checked_add(1).unwrap()
     }
     fn describe(&self, bytes: &[u8], mut output: impl Write) -> std::io::Result<()> {
         assert_eq!(bytes.iter().position(|&byte| byte != self.byte), None);
@@ -779,7 +814,7 @@ impl LzCmd for LzRepeat {
 #[derive(Debug, Clone)]
 struct LzAlternate {
     bytes: [u8; 2],
-    len: u16,
+    len: NonZeroU16,
 }
 impl LzAlternate {
     fn header(&self) -> LzCmdHeader {
@@ -787,29 +822,36 @@ impl LzAlternate {
     }
 
     fn for_each_possible_cmd<'data>(
-        mut consider: impl FnMut(Command<'data>) -> bool,
+        cur_chain: &mut Option<CommandChain<'data>>,
         decompressed_thus_far: &'data [u8],
+        prev_optimal_chains: &[CommandChain<'data>],
     ) {
+        // If there aren't enough bytes, don't even bother.
         let Some(last_two) = decompressed_thus_far.last_chunk::<2>() else {
             return;
         };
         // Otherwise, there'll be a gap between the first two and the first one checked for repetition.
-        assert_eq!(Self::MIN_DECOMPRESSED_LENGTH, 3);
+        assert_eq!(Self::MIN_DECOMPRESSED_LENGTH.get(), 3);
         for length in Self::possible_data_lengths(decompressed_thus_far) {
-            // If the bytes are no longer repeating alternated, stop.
-            if rev_idx(decompressed_thus_far, length) != last_two[usize::from(length % 2)] {
-                break;
-            }
-            // TODO: this command's cost is actually constant.
-            if !consider(Command::Alternate(Self {
+            let command = Command::Alternate(Self {
                 // Careful that the first byte of this must be the one we *just* checked against!
-                bytes: if length % 2 == 0 {
+                bytes: if length.get() % 2 == 0 {
                     *last_two
                 } else {
                     [last_two[1], last_two[0]]
                 },
                 len: length,
-            })) {
+            });
+
+            // If the bytes are no longer repeating alternated, stop.
+            if rev_idx(decompressed_thus_far, length.get())
+                != last_two[usize::from(length.get() % 2)]
+            {
+                break;
+            }
+            // There's no point in considering commands that are too costly by themselves,
+            // and since command costs increase monotonically we can thus skip all ulterior iterations too.
+            if !CommandChain::consider(cur_chain, command, prev_optimal_chains) {
                 break;
             }
         }
@@ -839,19 +881,19 @@ impl LzAlternate {
         dest.extend(
             std::iter::repeat(self.bytes)
                 .flatten()
-                .take(self.len.into()),
+                .take(self.len.get().into()),
         );
     }
 }
 impl LzCmd for LzAlternate {
-    fn decompressed_length(&self) -> u16 {
+    fn decompressed_length(&self) -> NonZeroU16 {
         self.len
     }
     // Less than this is just sparkling `LzData`. The same rationale as for `LzRepeat` applies.
-    const MIN_DECOMPRESSED_LENGTH: u16 = 3;
+    const MIN_DECOMPRESSED_LENGTH: NonZeroU16 = NonZeroU16::new(3).unwrap();
 
-    fn num_encoded_bytes(&self) -> u16 {
-        self.header().num_encoded_bytes() + 2
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
+        self.header().num_encoded_bytes().checked_add(2).unwrap()
     }
     fn describe(&self, bytes: &[u8], mut output: impl Write) -> std::io::Result<()> {
         assert_eq!(
@@ -874,7 +916,7 @@ impl LzCmd for LzAlternate {
 
 #[derive(Debug, Clone)]
 struct LzZero {
-    len: u16,
+    len: NonZeroU16,
 }
 impl LzZero {
     fn header(&self) -> LzCmdHeader {
@@ -882,26 +924,36 @@ impl LzZero {
     }
 
     fn for_each_possible_cmd<'data>(
-        mut consider: impl FnMut(Command<'data>) -> bool,
+        cur_chain: &mut Option<CommandChain<'data>>,
         decompressed_thus_far: &'data [u8],
+        prev_optimal_chains: &[CommandChain<'data>],
     ) {
+        // If there aren't enough bytes, don't even bother.
+        // (This helps commands with >1 minimum lengths, and doesn't hurt those with =1,
+        //  so it's kept for future-proofing.)
+        if gb_len(decompressed_thus_far.len()) < Self::MIN_DECOMPRESSED_LENGTH.get() {
+            return;
+        }
+
         let last_byte = *decompressed_thus_far.last().unwrap();
         assert_eq!(last_byte, 0);
         // Any bytes between the start of `possible_data_lengths` and `last_byte` must also be repeats.
-        if gb_len(decompressed_thus_far.len()) < Self::MIN_DECOMPRESSED_LENGTH
-            || last_n(decompressed_thus_far, Self::MIN_DECOMPRESSED_LENGTH)
-                .iter()
-                .any(|&byte| byte != last_byte)
+        if last_n(decompressed_thus_far, Self::MIN_DECOMPRESSED_LENGTH.get())
+            .iter()
+            .any(|&byte| byte != last_byte)
         {
             return;
         }
         for length in Self::possible_data_lengths(decompressed_thus_far) {
+            let command = Command::Zero(Self { len: length });
+
             // If the bytes are no longer repeating, stop.
-            if rev_idx(decompressed_thus_far, length) != last_byte {
+            if rev_idx(decompressed_thus_far, length.get()) != last_byte {
                 break;
             }
-            // TODO: this command's cost is actually constant.
-            if !consider(Command::Zero(Self { len: length })) {
+            // There's no point in considering commands that are too costly by themselves,
+            // and since command costs increase monotonically we can thus skip all ulterior iterations too.
+            if !CommandChain::consider(cur_chain, command, prev_optimal_chains) {
                 break;
             }
         }
@@ -920,18 +972,18 @@ impl LzZero {
     }
 
     fn decompress(&self, dest: &mut Vec<u8>) {
-        dest.extend(std::iter::repeat_n(0, self.len.into()));
+        dest.extend(std::iter::repeat_n(0, self.len.get().into()));
     }
 }
 impl LzCmd for LzZero {
-    fn decompressed_length(&self) -> u16 {
+    fn decompressed_length(&self) -> NonZeroU16 {
         self.len
     }
     // Note that this command uses the default minimum length of 1: unlike `LzRepeat`, `lzzero 1` is
     // *smaller* than `lzdata $00`! Thus, it's always worth attempting it when possible.
-    const MIN_DECOMPRESSED_LENGTH: u16 = 1;
+    const MIN_DECOMPRESSED_LENGTH: NonZeroU16 = NonZeroU16::new(1).unwrap();
 
-    fn num_encoded_bytes(&self) -> u16 {
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
         self.header().num_encoded_bytes()
     }
     fn describe(&self, bytes: &[u8], mut output: impl Write) -> std::io::Result<()> {
@@ -980,7 +1032,7 @@ trait LzCopyCmd: LzCmd {
 
     const CMD_ID: LzCmdId;
     fn start_ofs(&self) -> LzCopyStartOfs;
-    fn new(len: u16, start_ofs: LzCopyStartOfs, start_idx: usize) -> Option<Self>
+    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, start_idx: usize) -> Option<Self>
     where
         Self: Sized;
     fn header(&self) -> LzCmdHeader {
@@ -991,10 +1043,13 @@ trait LzCopyCmd: LzCmd {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LzCopyStartOfs(i16);
 impl LzCopyStartOfs {
-    fn new(src_end_idx: u16, copy_length: u16, dest_end_idx: u16) -> Self {
+    fn new(src_end_idx: u16, copy_length: NonZeroU16, dest_end_idx: u16) -> Self {
         // Since the copy's source and destination ranges are of equal length,
         // the offset between their start indices is equal to the offset between their end indices.
-        Self::from_raw(src_end_idx - (copy_length - 1), dest_end_idx - src_end_idx)
+        Self::from_raw(
+            src_end_idx - (copy_length.get() - 1),
+            dest_end_idx - src_end_idx,
+        )
     }
     fn new_reverse(src_end_idx: u16, copy_length: u16, dest_end_idx: u16) -> Self {
         // Since this copy's direction is backwards, we need to math differently.
@@ -1011,8 +1066,8 @@ impl LzCopyStartOfs {
         }
     }
 
-    fn num_encoded_bytes(&self) -> u16 {
-        if self.0 < 0 { 1 } else { 2 }
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
+        NonZeroU16::new(if self.0 < 0 { 1 } else { 2 }).unwrap()
     }
     fn serialize(&self, mut output: impl Write) -> std::io::Result<()> {
         if self.0 < 0 {
@@ -1051,8 +1106,9 @@ impl LzCopyStartOfs {
     }
 }
 fn for_each_possible_copy_cmd<'data>(
-    mut consider: impl FnMut(Command<'data>) -> bool,
-    decompressed_thus_far: &[u8],
+    cur_chain: &mut Option<CommandChain<'data>>,
+    decompressed_thus_far: &'data [u8],
+    prev_optimal_chains: &[CommandChain<'data>],
 ) {
     let last_byte = *decompressed_thus_far.last().unwrap();
     let last_byte_flipped = last_byte.reverse_bits();
@@ -1071,20 +1127,23 @@ fn for_each_possible_copy_cmd<'data>(
             // Check if a normal, forward copy is possible.
             let source_range = &decompressed_thus_far[..=usize::from(src_end_idx)];
             for length in LzCopyNormal::possible_data_lengths(source_range) {
+                let start_ofs = LzCopyStartOfs::new(src_end_idx, length, dest_end_idx);
+                let command = Command::CopyNormal(LzCopyNormal {
+                    len: length,
+                    start_ofs,
+                });
+
                 // If the copy doesn't match anymore, stop.
                 // It is okay for these two ranges to overlap, though!
                 // The first few non-overlapping bytes then get re-read, and implicitly repeated.
-                if rev_idx(decompressed_thus_far, length) != rev_idx(source_range, length) {
+                if rev_idx(decompressed_thus_far, length.get())
+                    != rev_idx(source_range, length.get())
+                {
                     break;
                 }
-                let start_ofs = LzCopyStartOfs::new(src_end_idx, length, dest_end_idx);
-                // Since this command's cost increases monotonically (though in a single step),
-                // if the cost becomes higher than the current best,
-                // any further attempts are guaranteed to fail.
-                if !consider(Command::CopyNormal(LzCopyNormal {
-                    len: length,
-                    start_ofs,
-                })) {
+                // There's no point in considering commands that are too costly by themselves,
+                // and since command costs increase monotonically we can thus skip all ulterior iterations too.
+                if !CommandChain::consider(cur_chain, command, prev_optimal_chains) {
                     break;
                 }
             }
@@ -1098,18 +1157,22 @@ fn for_each_possible_copy_cmd<'data>(
             // thus we need to halve the range of `active_bytes`.
             let source_range = &active_bytes[..active_bytes.len() / 2]; // Intentionally rounding down.
             for length in LzCopyReversed::possible_data_lengths(source_range) {
-                // If the copy doesn't match anymore, stop.
-                if rev_idx(decompressed_thus_far, length) != source_range[usize::from(length) - 1] {
-                    break;
-                }
-                let start_ofs = LzCopyStartOfs::new_reverse(src_end_idx, length, dest_end_idx);
-                // Since this command's cost increases monotonically (though in a single step),
-                // if the cost becomes higher than the current best,
-                // any further attempts are guaranteed to fail.
-                if !consider(Command::CopyReversed(LzCopyReversed {
+                let start_ofs =
+                    LzCopyStartOfs::new_reverse(src_end_idx, length.get(), dest_end_idx);
+                let command = Command::CopyReversed(LzCopyReversed {
                     len: length,
                     start_ofs,
-                })) {
+                });
+
+                // If the copy doesn't match anymore, stop.
+                if rev_idx(decompressed_thus_far, length.get())
+                    != source_range[usize::from(length.get()) - 1]
+                {
+                    break;
+                }
+                // There's no point in considering commands that are too costly by themselves,
+                // and since command costs increase monotonically we can thus skip all ulterior iterations too.
+                if !CommandChain::consider(cur_chain, command, prev_optimal_chains) {
                     break;
                 }
             }
@@ -1119,22 +1182,23 @@ fn for_each_possible_copy_cmd<'data>(
             // Check if a normal, forward copy is possible.
             let source_range = &decompressed_thus_far[..=usize::from(src_end_idx)];
             for length in LzCopyFlipped::possible_data_lengths(source_range) {
+                let start_ofs = LzCopyStartOfs::new(src_end_idx, length, dest_end_idx);
+                let command = Command::CopyFlipped(LzCopyFlipped {
+                    len: length,
+                    start_ofs,
+                });
+
                 // If the copy doesn't match anymore, stop.
                 // It is okay for these two ranges to overlap, though!
                 // The first few non-overlapping bytes then get re-read, and implicitly repeated (but flipped again!).
-                if rev_idx(decompressed_thus_far, length)
-                    != rev_idx(source_range, length).reverse_bits()
+                if rev_idx(decompressed_thus_far, length.get())
+                    != rev_idx(source_range, length.get()).reverse_bits()
                 {
                     break;
                 }
-                let start_ofs = LzCopyStartOfs::new(src_end_idx, length, dest_end_idx);
-                // Since this command's cost increases monotonically (though in a single step),
-                // if the cost becomes higher than the current best,
-                // any further attempts are guaranteed to fail.
-                if !consider(Command::CopyFlipped(LzCopyFlipped {
-                    len: length,
-                    start_ofs,
-                })) {
+                // There's no point in considering commands that are too costly by themselves,
+                // and since command costs increase monotonically we can thus skip all ulterior iterations too.
+                if !CommandChain::consider(cur_chain, command, prev_optimal_chains) {
                     break;
                 }
             }
@@ -1144,11 +1208,11 @@ fn for_each_possible_copy_cmd<'data>(
 
 #[derive(Debug, Clone)]
 struct LzCopyNormal {
-    len: u16,
+    len: NonZeroU16,
     start_ofs: LzCopyStartOfs,
 }
 impl LzCmd for LzCopyNormal {
-    fn decompressed_length(&self) -> u16 {
+    fn decompressed_length(&self) -> NonZeroU16 {
         self.len
     }
 
@@ -1157,11 +1221,13 @@ impl LzCmd for LzCopyNormal {
     //        entering the appropriate copy loop (with an ad-hoc correction for the “flipped”
     //        variant), and incrementing/decrementing the source *before* each copy within the loop.
     //        (Make sure to change `for_each_possible_cmd` accordingly!)
-    const MIN_DECOMPRESSED_LENGTH: u16 = 1;
+    const MIN_DECOMPRESSED_LENGTH: NonZeroU16 = NonZeroU16::new(1).unwrap();
 
-    fn num_encoded_bytes(&self) -> u16 {
-        self.make_header(LzCmdId::CopyNormal).num_encoded_bytes()
-            + self.start_ofs.num_encoded_bytes()
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
+        self.make_header(LzCmdId::CopyNormal)
+            .num_encoded_bytes()
+            .checked_add(self.start_ofs.num_encoded_bytes().get())
+            .unwrap()
     }
     fn describe(&self, bytes: &[u8], mut output: impl Write) -> std::io::Result<()> {
         writeln!(
@@ -1176,30 +1242,27 @@ impl LzCmd for LzCopyNormal {
 impl LzCopyCmd for LzCopyNormal {
     fn decompress(&self, dest: &mut Vec<u8>) {
         let start_idx = self.start_ofs.idx_within(dest).unwrap();
-        dest.extend_from_within(start_idx..start_idx + usize::from(self.len));
+        dest.extend_from_within(start_idx..start_idx + usize::from(self.len.get()));
     }
 
     const CMD_ID: LzCmdId = LzCmdId::CopyNormal;
     fn start_ofs(&self) -> LzCopyStartOfs {
         self.start_ofs
     }
-    fn new(encoded_len: u16, start_ofs: LzCopyStartOfs, _copy_start_idx: usize) -> Option<Self> {
+    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, _copy_start_idx: usize) -> Option<Self> {
         // If the copy's source writes past the end of the already-decompressed data,
         // it will merely read the already-decompressed data, which is fine (and useful!).
-        Some(Self {
-            len: Self::decode_length(encoded_len),
-            start_ofs,
-        })
+        Some(Self { len, start_ofs })
     }
 }
 
 #[derive(Debug, Clone)]
 struct LzCopyFlipped {
-    len: u16,
+    len: NonZeroU16,
     start_ofs: LzCopyStartOfs,
 }
 impl LzCmd for LzCopyFlipped {
-    fn decompressed_length(&self) -> u16 {
+    fn decompressed_length(&self) -> NonZeroU16 {
         self.len
     }
 
@@ -1208,11 +1271,13 @@ impl LzCmd for LzCopyFlipped {
     //        entering the appropriate copy loop (with an ad-hoc correction for the “flipped”
     //        variant), and incrementing/decrementing the source *before* each copy within the loop.
     //        (Make sure to change `for_each_possible_cmd` accordingly!)
-    const MIN_DECOMPRESSED_LENGTH: u16 = 1;
+    const MIN_DECOMPRESSED_LENGTH: NonZeroU16 = NonZeroU16::new(1).unwrap();
 
-    fn num_encoded_bytes(&self) -> u16 {
-        self.make_header(LzCmdId::CopyNormal).num_encoded_bytes()
-            + self.start_ofs.num_encoded_bytes()
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
+        self.make_header(LzCmdId::CopyNormal)
+            .num_encoded_bytes()
+            .checked_add(self.start_ofs.num_encoded_bytes().get())
+            .unwrap()
     }
     fn describe(&self, bytes: &[u8], mut output: impl Write) -> std::io::Result<()> {
         writeln!(
@@ -1226,8 +1291,10 @@ impl LzCmd for LzCopyFlipped {
 }
 impl LzCopyCmd for LzCopyFlipped {
     fn decompress(&self, dest: &mut Vec<u8>) {
+        dest.reserve(self.len.get().into());
+
         let mut start_idx = self.start_ofs.idx_within(dest).unwrap();
-        for _ in 0..self.len {
+        for _ in 0..self.len.get() {
             dest.push(dest[start_idx].reverse_bits());
             start_idx += 1;
         }
@@ -1237,23 +1304,20 @@ impl LzCopyCmd for LzCopyFlipped {
     fn start_ofs(&self) -> LzCopyStartOfs {
         self.start_ofs
     }
-    fn new(encoded_len: u16, start_ofs: LzCopyStartOfs, _copy_start_idx: usize) -> Option<Self> {
+    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, _copy_start_idx: usize) -> Option<Self> {
         // If the copy's source writes past the end of the already-decompressed data,
         // it will merely read the already-decompressed data, which is fine (and useful!).
-        Some(Self {
-            len: Self::decode_length(encoded_len),
-            start_ofs,
-        })
+        Some(Self { len, start_ofs })
     }
 }
 
 #[derive(Debug, Clone)]
 struct LzCopyReversed {
-    len: u16,
+    len: NonZeroU16,
     start_ofs: LzCopyStartOfs,
 }
 impl LzCmd for LzCopyReversed {
-    fn decompressed_length(&self) -> u16 {
+    fn decompressed_length(&self) -> NonZeroU16 {
         self.len
     }
 
@@ -1262,11 +1326,13 @@ impl LzCmd for LzCopyReversed {
     //        entering the appropriate copy loop (with an ad-hoc correction for the “flipped”
     //        variant), and incrementing/decrementing the source *before* each copy within the loop.
     //        (Make sure to change `for_each_possible_cmd` accordingly!)
-    const MIN_DECOMPRESSED_LENGTH: u16 = 1;
+    const MIN_DECOMPRESSED_LENGTH: NonZeroU16 = NonZeroU16::new(1).unwrap();
 
-    fn num_encoded_bytes(&self) -> u16 {
-        self.make_header(LzCmdId::CopyNormal).num_encoded_bytes()
-            + self.start_ofs.num_encoded_bytes()
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
+        self.make_header(LzCmdId::CopyNormal)
+            .num_encoded_bytes()
+            .checked_add(self.start_ofs.num_encoded_bytes().get())
+            .unwrap()
     }
     fn describe(&self, bytes: &[u8], mut output: impl Write) -> std::io::Result<()> {
         writeln!(
@@ -1280,8 +1346,10 @@ impl LzCmd for LzCopyReversed {
 }
 impl LzCopyCmd for LzCopyReversed {
     fn decompress(&self, dest: &mut Vec<u8>) {
+        dest.reserve(self.len.get().into());
+
         let mut start_idx = self.start_ofs.idx_within(dest).unwrap();
-        for _ in 0..self.len {
+        for _ in 0..self.len.get() {
             dest.push(dest[start_idx]);
             start_idx -= 1;
         }
@@ -1291,10 +1359,9 @@ impl LzCopyCmd for LzCopyReversed {
     fn start_ofs(&self) -> LzCopyStartOfs {
         self.start_ofs
     }
-    fn new(encoded_len: u16, start_ofs: LzCopyStartOfs, copy_start_idx: usize) -> Option<Self> {
-        let len = Self::decode_length(encoded_len);
+    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, copy_start_idx: usize) -> Option<Self> {
         copy_start_idx
-            .checked_sub((len - 1).into())
+            .checked_sub((len.get() - 1).into())
             .map(|_end_idx| Self { len, start_ofs })
     }
 }
@@ -1317,7 +1384,7 @@ trait LzSpecialCmd<'data>: LzCmd {
 
         output.write_all(&[
             Self::CMD_ID as u8,
-            (nibbles.len() - usize::from(Self::MIN_DECOMPRESSED_LENGTH))
+            (nibbles.len() - usize::from(Self::MIN_DECOMPRESSED_LENGTH.get()))
                 .try_into()
                 .unwrap(),
         ])?;
@@ -1341,14 +1408,14 @@ trait LzSpecialCmd<'data>: LzCmd {
             .ok_or_else(|| eof_err("EOF found instead of special command's length"))?;
         let num_nibbles = Self::decode_length((*encoded_len).into());
         let (payload, rest) = after_len
-            .split_at_checked(num_bytes_to_encode_nibbles(num_nibbles).into())
+            .split_at_checked(num_bytes_to_encode_nibbles(num_nibbles).get().into())
             .ok_or_else(|| eof_err("EOF while reading special command's payload"))?;
         *bytes = rest;
         Ok(Self::decode(
             payload
                 .iter()
                 .flat_map(|&byte| [byte >> 4, byte & 0x0f])
-                .take(num_nibbles.into()),
+                .take(num_nibbles.get().into()),
         ))
     }
 
@@ -1357,50 +1424,61 @@ trait LzSpecialCmd<'data>: LzCmd {
     fn make_cmd(decompressed: &'data [u8]) -> Command<'data>;
     fn can_encode(byte: u8) -> bool;
     fn for_each_possible_cmd(
-        mut consider: impl FnMut(Command<'data>) -> bool,
+        cur_chain: &mut Option<CommandChain<'data>>,
         decompressed_thus_far: &'data [u8],
+        prev_optimal_chains: &[CommandChain<'data>],
     ) {
+        // If there aren't enough bytes, don't even bother.
+        // (This helps commands with >1 minimum lengths, and doesn't hurt those with =1,
+        //  so it's kept for future-proofing.)
+        if gb_len(decompressed_thus_far.len()) < Self::MIN_DECOMPRESSED_LENGTH.get() {
+            return;
+        }
+
         // Check that all bytes before the smallest length are also encodable.
-        if gb_len(decompressed_thus_far.len()) < Self::MIN_DECOMPRESSED_LENGTH
-            || last_n(decompressed_thus_far, Self::MIN_DECOMPRESSED_LENGTH)
-                .iter()
-                .any(|&byte| !Self::can_encode(byte))
+        if last_n(decompressed_thus_far, Self::MIN_DECOMPRESSED_LENGTH.get())
+            .iter()
+            .any(|&byte| !Self::can_encode(byte))
         {
             return;
         }
         for length in Self::possible_data_lengths(decompressed_thus_far) {
-            if !Self::can_encode(rev_idx(decompressed_thus_far, length)) {
+            if !Self::can_encode(rev_idx(decompressed_thus_far, length.get())) {
                 break;
             }
-            // Since this command's cost increases monotonically, if the cost is higher than the
-            // current best sum, any further attempts are guaranteed to fail.
-            if !consider(Self::make_cmd(last_n(decompressed_thus_far, length))) {
+            let command = Self::make_cmd(last_n(decompressed_thus_far, length.get()));
+            // There's no point in considering commands that are too costly by themselves,
+            // and since command costs increase monotonically we can thus skip all ulterior iterations too.
+            if !CommandChain::consider(cur_chain, command, prev_optimal_chains) {
                 break;
             }
         }
     }
 }
 impl<'data, T: LzSpecialCmd<'data>> LzCmd for T {
-    fn decompressed_length(&self) -> u16 {
-        self.compressed_nibbles().len().try_into().unwrap()
+    fn decompressed_length(&self) -> NonZeroU16 {
+        NonZeroU16::new(self.compressed_nibbles().len().try_into().unwrap()).unwrap()
     }
 
     // FIXME: min length should be 2, and then the max length should become 257,
     //        or that value reserved for some special purpose...
-    const MIN_DECOMPRESSED_LENGTH: u16 = 1;
+    const MIN_DECOMPRESSED_LENGTH: NonZeroU16 = NonZeroU16::new(1).unwrap();
     // All of the special commands use an 8-bit length instead of the regular header encoding.
-    const MAX_DECOMPRESSED_LENGTH: u16 = Self::MIN_DECOMPRESSED_LENGTH + 256 - 1;
+    const MAX_DECOMPRESSED_LENGTH: NonZeroU16 =
+        Self::MIN_DECOMPRESSED_LENGTH.checked_add(256 - 1).unwrap();
 
-    fn num_encoded_bytes(&self) -> u16 {
-        1 + 1 + num_bytes_to_encode_nibbles(self.decompressed_length())
+    fn num_encoded_bytes(&self) -> NonZeroU16 {
+        num_bytes_to_encode_nibbles(self.decompressed_length())
+            .checked_add(1 + 1)
+            .unwrap()
     }
     fn describe(&self, bytes: &[u8], mut output: impl Write) -> std::io::Result<()> {
         writeln!(output, "\t{} {}", Self::DESCRIBING_NAME, Bytes(bytes))
     }
 }
-fn num_bytes_to_encode_nibbles(num_nibbles: u16) -> u16 {
+fn num_bytes_to_encode_nibbles(num_nibbles: NonZeroU16) -> NonZeroU16 {
     // If the number of nibbles is odd, that requires an entire byte! So, we round up.
-    num_nibbles.div_ceil(2)
+    num_nibbles.div_ceil(NonZeroU16::new(2).unwrap())
 }
 
 #[derive(Debug, Clone)]
