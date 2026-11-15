@@ -104,7 +104,7 @@ fn main() {
         Ok(bytes) => bytes,
     };
 
-    let (output, output_filename) = match Options::path_arg(options.output.as_deref()) {
+    let (mut output, output_filename) = match Options::path_arg(options.output.as_deref()) {
         Some(path) => match File::create(path) {
             Err(err) => {
                 eprintln!(
@@ -143,7 +143,10 @@ fn main() {
             };
             let decompressed = decompress(&commands);
 
-            todo!()
+            match output_mode {
+                OutputMode::Binary => output.write_all(&decompressed),
+                OutputMode::Textual => todo!(),
+            }
         }
     };
     if let Err(err) = res {
