@@ -426,8 +426,8 @@ fn deserialize<'data>(compressed: &'data [u8]) -> std::io::Result<Vec<Command<'d
 
     let mut commands = Vec::new();
     let mut rest = compressed;
+    let mut decompressed_len_thus_far = 0;
     loop {
-        let decompressed_thus_far = rest;
         let len_before_cmd = rest.len();
 
         let cmd = match LzCmdHeader::try_deserialize(&mut rest)? {
@@ -453,7 +453,7 @@ fn deserialize<'data>(compressed: &'data [u8]) -> std::io::Result<Vec<Command<'d
             }) => Command::CopyNormal(LzCopyNormal::deserialize(
                 encoded_len,
                 &mut rest,
-                decompressed_thus_far,
+                decompressed_len_thus_far,
             )?),
             Ok(LzCmdHeader {
                 cmd_id: LzCmdId::CopyFlipped,
@@ -461,7 +461,7 @@ fn deserialize<'data>(compressed: &'data [u8]) -> std::io::Result<Vec<Command<'d
             }) => Command::CopyFlipped(LzCopyFlipped::deserialize(
                 encoded_len,
                 &mut rest,
-                decompressed_thus_far,
+                decompressed_len_thus_far,
             )?),
             Ok(LzCmdHeader {
                 cmd_id: LzCmdId::CopyReversed,
@@ -469,7 +469,7 @@ fn deserialize<'data>(compressed: &'data [u8]) -> std::io::Result<Vec<Command<'d
             }) => Command::CopyReversed(LzCopyReversed::deserialize(
                 encoded_len,
                 &mut rest,
-                decompressed_thus_far,
+                decompressed_len_thus_far,
             )?),
             Err(LzSpecialCmdId::SpecialPackhi0) => {
                 Command::SpecialPackhi0(LzSpecialPackhi0::deserialize(&mut rest)?)
@@ -483,6 +483,7 @@ fn deserialize<'data>(compressed: &'data [u8]) -> std::io::Result<Vec<Command<'d
             Err(LzSpecialCmdId::End) => break,
         };
 
+        decompressed_len_thus_far += cmd.decompressed_length().get();
         assert_eq!(
             gb_len(len_before_cmd - rest.len()),
             cmd.num_encoded_bytes().get(),
@@ -1013,19 +1014,20 @@ trait LzCopyCmd: LzCmd {
     fn deserialize(
         encoded_len: u16,
         input: &mut &[u8],
-        decompressed_thus_far: &[u8],
+        decompressed_len_thus_far: u16,
     ) -> std::io::Result<Self>
     where
         Self: Sized,
     {
         let start_ofs = LzCopyStartOfs::deserialize(input)?;
-        // TODO: check that the start and end offsets are in range
-        let start_idx = start_ofs.idx_within(decompressed_thus_far).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "copy start offset out of range",
-            )
-        })?;
+        let start_idx = start_ofs
+            .idx_within_len(decompressed_len_thus_far)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "copy start offset out of range",
+                )
+            })?;
         Self::new(Self::decode_length(encoded_len), start_ofs, start_idx).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1038,7 +1040,7 @@ trait LzCopyCmd: LzCmd {
 
     const CMD_ID: LzCmdId;
     fn start_ofs(&self) -> LzCopyStartOfs;
-    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, start_idx: usize) -> Option<Self>
+    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, start_idx: u16) -> Option<Self>
     where
         Self: Sized;
     fn header(&self) -> LzCmdHeader {
@@ -1102,6 +1104,14 @@ impl LzCopyStartOfs {
         }
     }
 
+    fn idx_within_len(&self, slice_len: u16) -> Option<u16> {
+        if self.0 < 0 {
+            slice_len.checked_add_signed(self.0)
+        } else {
+            let start_idx = self.0.cast_unsigned();
+            (start_idx < slice_len).then_some(start_idx)
+        }
+    }
     fn idx_within(&self, slice: &[u8]) -> Option<usize> {
         if self.0 < 0 {
             slice.len().checked_add_signed(self.0.into())
@@ -1260,7 +1270,7 @@ impl LzCopyCmd for LzCopyNormal {
     fn start_ofs(&self) -> LzCopyStartOfs {
         self.start_ofs
     }
-    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, _copy_start_idx: usize) -> Option<Self> {
+    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, _copy_start_idx: u16) -> Option<Self> {
         // If the copy's source writes past the end of the already-decompressed data,
         // it will merely read the already-decompressed data, which is fine (and useful!).
         Some(Self { len, start_ofs })
@@ -1314,7 +1324,7 @@ impl LzCopyCmd for LzCopyFlipped {
     fn start_ofs(&self) -> LzCopyStartOfs {
         self.start_ofs
     }
-    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, _copy_start_idx: usize) -> Option<Self> {
+    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, _copy_start_idx: u16) -> Option<Self> {
         // If the copy's source writes past the end of the already-decompressed data,
         // it will merely read the already-decompressed data, which is fine (and useful!).
         Some(Self { len, start_ofs })
@@ -1369,9 +1379,9 @@ impl LzCopyCmd for LzCopyReversed {
     fn start_ofs(&self) -> LzCopyStartOfs {
         self.start_ofs
     }
-    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, copy_start_idx: usize) -> Option<Self> {
+    fn new(len: NonZeroU16, start_ofs: LzCopyStartOfs, copy_start_idx: u16) -> Option<Self> {
         copy_start_idx
-            .checked_sub((len.get() - 1).into())
+            .checked_sub(len.get() - 1)
             .map(|_end_idx| Self { len, start_ofs })
     }
 }
