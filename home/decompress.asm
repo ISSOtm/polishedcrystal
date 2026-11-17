@@ -205,6 +205,9 @@ DEF LZ_SPECIAL_PACKLO0      EQU $fe ; (len 1..256)
 
 ;; LZ_COPY_*: Copy some bytes from the *output* stream, i.e. re-emit bytes previously decompressed.
 
+.long_copy ; Jumped to with A = ccc0l111, B = 111ccc0l
+	and b ; ccc0?c0l, but we only care about its upper 3 bits and LSB.
+	ld b, a
 .lz_copy
 	ld a, [de]
 	bit 7, a
@@ -355,15 +358,10 @@ DEF LZ_SPECIAL_PACKLO0      EQU $fe ; (len 1..256)
 	inc de
 	ld c, a
 	; b =  111ccc0l
-	ld a, %00111100
-	and b
-	rlca
-	rlca
-	rlca
-	; a = ccc00001
-	and b
-	; a = ccc0000l
-	ld b, a
+	ld a, b
+	swap a ; cc0l111c
+	rrca ;   ccc0l111, carry is a copy of MSB of command
+	jr c, .long_copy
 	and LZ_CMD
 	jr nz, .process_cmd
 	jr .copy_9_bit_len
