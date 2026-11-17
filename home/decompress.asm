@@ -36,9 +36,9 @@ _Decompress:
 DEF LZ_CMD           EQU %11100000 ; command id (bits 5-7)
 
 DEF LZ_DATA          EQU 0 << 5 ; Read literal data for n bytes.
-DEF LZ_REPEAT        EQU 1 << 5 ; Write the same byte for n bytes.
-DEF LZ_ALTERNATE     EQU 2 << 5 ; Alternate two bytes for n bytes.
-DEF LZ_ZERO          EQU 3 << 5 ; Write 0 for n bytes.
+DEF LZ_ALTERNATE     EQU 1 << 5 ; Alternate two bytes for n bytes.
+DEF LZ_ZERO          EQU 2 << 5 ; Write 0 for n bytes.
+DEF LZ_REPEAT        EQU 3 << 5 ; Write the same byte for n bytes.
 DEF LZ_COPY_NORMAL   EQU 4 << 5 ; Repeat n bytes from the offset.
 DEF LZ_COPY_FLIPPED  EQU 5 << 5 ; Repeat n bitflipped bytes.
 DEF LZ_COPY_REVERSED EQU 6 << 5 ; Repeat n bytes in reverse.
@@ -310,15 +310,19 @@ DEF LZ_SPECIAL_PACKLO0      EQU $fe ; (len 1..256)
 	xor c ; a = %000l llll
 	ld c, a ; Thus, C = length.
 
+	ld a, b
+	and LZ_CMD
 .process_cmd
-	ld a, b ; command in the upper 3 bits
-	; length in bc, upper 7 bits of b ignored
-	rla
+	; length in BC (upper 7 bits of B ignored), command ID in A (lower 5 bits clear)
+	add a
 	jr c, .lz_copy
-
-	cp LOW(LZ_ALTERNATE << 1) ; `rla` just shifted it left.
-	jr z, .lz_alternate
-	jr nc, .lz_zero
+	; This leaves command IDs 1, 2, and 3 (0 is LZ_DATA, and that doesn't reach here) in the upper 2 bits.
+	add a ; 1 becomes (NC, NZ); 2 becomes (C, Z); 3 becomes (C, NZ)
+	static_assert LZ_ALTERNATE == 1 << 5
+	jr nc, .lz_alternate
+	static_assert LZ_ZERO == 2 << 5
+	jr z, .fill ; LZ_ZERO (jumps with A == 0)
+	static_assert LZ_REPEAT == 3 << 5
 
 ;; LZ_REPEAT: Write N+1 instances of the next byte in the input stream.
 
@@ -326,13 +330,11 @@ DEF LZ_SPECIAL_PACKLO0      EQU $fe ; (len 1..256)
 	ld a, [de]
 	ld [hli], a
 	inc de
-	jr .fill
+	; fallthrough
 
 ;; LZ_ZERO: set N of the output bytes to zeros.
 
-.lz_zero
-	xor a
-.fill
+.fill ; Jumped to with A == 0.
 	srl b
 	rr c
 	inc c

@@ -245,9 +245,9 @@ static void print_byte_list(FILE *file, ByteSpan bytes) {
 // “Normal” command IDs.
 enum LzCmdId {
 	LZ_DATA,
-	LZ_REPEAT,
 	LZ_ALTERNATE,
 	LZ_ZERO,
+	LZ_REPEAT,
 	LZ_COPY_NORMAL,
 	LZ_COPY_FLIPPED,
 	LZ_COPY_REVERSED,
