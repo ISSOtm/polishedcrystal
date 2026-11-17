@@ -60,7 +60,7 @@ DEF LZ_SPECIAL_PACKLO0      EQU $fe ; (len 1..256)
 	call .Main
 	add sp, 2 ; Clear the output address from the stack
 
-	jmp SwapHLDE
+	ret
 
 ; === Main body of the decompressor starts below ===
 ;

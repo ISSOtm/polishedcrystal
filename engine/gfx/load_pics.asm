@@ -91,11 +91,11 @@ _PrepareFrontpic:
 	ldh [rWBK], a
 	call FarDecompressInB
 	; Save decompressed size
-	swap e
-	swap d
-	ld a, d
+	swap l
+	swap h
+	ld a, h
 	and $f0
-	or e
+	or l
 	ld [wMonAnimationSize], a
 
 	pop bc
