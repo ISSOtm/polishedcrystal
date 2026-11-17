@@ -380,14 +380,15 @@ DEF LZ_SPECIAL_PACKLO0      EQU $fe ; (len 1..256)
 	static_assert LZ_END == $ff
 	inc a ; Is it `LZ_END`?
 	ret z
+	add 2 ; After `inc a` and this: $FC becomes (NC, NZ); $FD becomes (C, Z); $FE becomes (C, NZ)
 
 	ld a, [de] ; All special commands read an 8-bit length.
 	inc de
 	ld c, a
-	ld a, b ; Command ID: $fc, $fd, or $fe.
-	cp LZ_SPECIAL_PACK16_SHORT
+	static_assert LZ_SPECIAL_PACK16_SHORT == $fd
 	jr z, .special_pack16
-	jr nc, .special_packlo0
+	static_assert LZ_SPECIAL_PACKLO0 == $fe
+	jr c, .special_packlo0
 
 ;; LZ_SPECIAL_PACKHI0: Read nibbles from the input stream, and output them right-padded (`$x0`).
 
