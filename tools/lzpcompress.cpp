@@ -796,6 +796,8 @@ struct LzSpecialCmd : public LzCmd {
 	// FIXME: min length should be 2, and then the max length should become 257,
 	//        or that value reserved for some special purpose...
 	constexpr static uint16_t MIN_LENGTH = 1;
+	// Added to the encoded length to generate lengths the decompressor can process more easily.
+	constexpr static uint8_t ENCODING_OFS = 1;
 
 	uint16_t min_length() const override { return MIN_LENGTH; }
 
@@ -820,7 +822,7 @@ protected:
 	 */
 	void serialize_special_header(FILE *file, LzSpecialCmdId cmd_id, char const *filename) const {
 		xputc(cmd_id, file, filename);
-		xputc(this->len - 1, file, filename);
+		xputc(this->len - MIN_LENGTH + ENCODING_OFS, file, filename);
 	}
 
 	template<typename Func>
@@ -1246,7 +1248,8 @@ static std::vector<std::pair<Command, ByteSpan>> deserialize(std::vector<uint8_t
 		               &require_bytes,
 		               &cmd_start_idx]() -> Command { // Immediately invoked function expression.
 			if ((first_byte & 0b111'111'00) == 0b111'111'00) { // Special commands.
-				uint16_t len = require_bytes(1)[0] + LzSpecialCmd::MIN_LENGTH;
+				uint16_t len =
+					require_bytes(1)[0] + LzSpecialCmd::MIN_LENGTH - LzSpecialCmd::ENCODING_OFS;
 				payload_start_idx = byte_idx;
 				require_bytes((len + 1) / 2); // Halved, rounding up.
 				switch (first_byte) {

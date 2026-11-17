@@ -384,7 +384,6 @@ DEF LZ_SPECIAL_PACKLO0      EQU $fe ; (len 1..256)
 	ld a, [de] ; All special commands read an 8-bit length.
 	inc de
 	ld c, a
-	inc c ; TODO: this should be done in the compressor instead!
 	ld a, b ; Command ID: $fc, $fd, or $fe.
 	cp LZ_SPECIAL_PACK16_SHORT
 	jr z, .special_pack16
